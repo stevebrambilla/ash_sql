@@ -2080,6 +2080,8 @@ defmodule AshSql.Expr do
         {Jason.encode!(%{exception: inspect(exception), input: Map.new(input)}), acc}
       end
 
+    token = row_dependent_token(query, bindings)
+
     if type do
       # This is a type hint, if we're raising an error, we tell it what the value
       # type *would* be in this expression so that we can return a "NULL" of that type
@@ -2097,14 +2099,45 @@ defmodule AshSql.Expr do
       if type do
         dynamic = Ecto.Query.dynamic(type(fragment("NULL"), ^type))
 
-        {Ecto.Query.dynamic(fragment("ash_raise_error(?::jsonb, ?)", ^encoded, ^dynamic)), acc}
+        {Ecto.Query.dynamic(fragment("ash_raise_error_with_token(?::jsonb, ?, ?)", ^encoded, ^dynamic, ^token)), acc}
       else
-        {Ecto.Query.dynamic(fragment("ash_raise_error(?::jsonb)", ^encoded)), acc}
+        {Ecto.Query.dynamic(fragment("ash_raise_error_with_token(?::jsonb, ?)", ^encoded, ^token)), acc}
       end
     else
-      {Ecto.Query.dynamic(fragment("ash_raise_error(?::jsonb)", ^encoded)), acc}
+      {Ecto.Query.dynamic(fragment("ash_raise_error_with_token(?::jsonb, ?)", ^encoded, ^token)), acc}
     end
   end
+
+  # WIP: adding these manually for now:
+  #
+  # CREATE OR REPLACE FUNCTION public.ash_raise_error_with_token(json_data jsonb, token boolean)
+  #  RETURNS boolean
+  #  LANGUAGE plpgsql
+  #  IMMUTABLE
+  # AS $function$
+  # BEGIN
+  #     -- Raise an error with the provided JSON data.
+  #     -- The JSON object is converted to text for inclusion in the error message.
+  #     -- token is intentionally ignored; its presence makes the call non-constant at the call site
+  #     RAISE EXCEPTION 'ash_error: %', json_data::text;
+  #     RETURN NULL;
+  # END;
+  # $function$
+  #
+  #
+  # CREATE OR REPLACE FUNCTION public.ash_raise_error_with_token(json_data jsonb, type_signal anycompatible, token boolean)
+  #  RETURNS anycompatible
+  #  LANGUAGE plpgsql
+  #  IMMUTABLE
+  # AS $function$
+  # BEGIN
+  #     -- Raise an error with the provided JSON data.
+  #     -- The JSON object is converted to text for inclusion in the error message.
+  #     -- token is intentionally ignored; its presence makes the call non-constant at the call site
+  #     RAISE EXCEPTION 'ash_error: %', json_data::text;
+  #     RETURN NULL;
+  # END;
+  # $function$
 
   defp default_dynamic_expr(
          query,
@@ -3239,6 +3272,39 @@ defmodule AshSql.Expr do
       {query.__ash_bindings__.sql_behaviour.type_expr(expr, type), acc}
     else
       {expr, acc}
+    end
+  end
+
+  defp row_dependent_token(query, bindings) do
+    resource = query.__ash_bindings__.resource
+    ref_binding = bindings.root_binding
+
+    # Prefer first primary key, fallback to first attribute.
+    attr_name =
+      case Ash.Resource.Info.primary_key(resource) do
+        [first_pk | _] ->
+          first_pk
+
+        _ ->
+          case Ash.Resource.Info.attributes(resource) do
+            [%{name: name} | _] -> name
+            _ -> nil
+          end
+      end
+
+    if ref_binding && attr_name do
+      if bindings[:parent?] &&
+           ref_binding not in List.wrap(bindings[:lateral_join_bindings]) do
+        Ecto.Query.dynamic(
+          not is_nil(field(parent_as(^ref_binding), ^attr_name))
+        )
+      else
+        Ecto.Query.dynamic(
+          not is_nil(field(as(^ref_binding), ^attr_name))
+        )
+      end
+    else
+      Ecto.Query.dynamic(false)
     end
   end
 
